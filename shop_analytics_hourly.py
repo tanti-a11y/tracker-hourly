@@ -25,7 +25,9 @@ import json
 import os
 import re
 import sys
+import subprocess
 import time
+import urllib.request
 from datetime import datetime, timedelta
 
 from playwright.sync_api import sync_playwright
@@ -36,6 +38,9 @@ URL = "https://seller-id.tokopedia.com/compass/data-overview?shop_region=ID&plat
 SHEET_ID = "1ZXO2y7M8Ggpr4J_4ixSk5tJNSzWTJQTjf579uRpELwg"
 SHEET_TAB = "Sheet1"
 HERE = os.path.dirname(os.path.abspath(__file__))
+PID_FILE = os.path.join(HERE, "worker.pid")
+CHROME_PROFILE = r"C:\chrome-nivea"  # sama dengan tombol "Buka Chrome" di panel
+RETRY_SEC = 120  # jeda coba ulang kalau gagal (sinyal putus dll)
 
 COLUMNS = [
     "Captured At", "Target Hour", "Updated On", "Fresh",
@@ -136,8 +141,8 @@ def scrape_once(ctx, target_hour, max_wait_min):
         text2 = page.locator("body").inner_text()
         bd = parse_breakdown(text2)
         if not bd:
-            os.makedirs("debug", exist_ok=True)
-            page.screenshot(path=os.path.join("debug", f"{datetime.now():%H%M%S}_breakdown.png"))
+            os.makedirs(os.path.join(HERE, "debug"), exist_ok=True)
+            page.screenshot(path=os.path.join(HERE, "debug", f"{datetime.now():%H%M%S}_breakdown.png"))
 
         row = {c: "" for c in COLUMNS}
         row.update(km)
@@ -174,26 +179,119 @@ def open_worksheet(sheet_id, tab):
     return ws
 
 
-def send_to_sheet(ws, row, pending_path):
-    """Kirim baris ke Google Sheet. Kalau gagal, simpan di file pending & dicoba lagi jam berikutnya."""
-    queue = []
-    if os.path.exists(pending_path):
-        with open(pending_path, encoding="utf-8") as f:
-            queue = [json.loads(l) for l in f if l.strip()]
-    queue.append(row)
-    left = []
-    try:
-        ws.append_rows([[r.get(c, "") for c in COLUMNS] for r in queue], value_input_option="USER_ENTERED")
-    except Exception as e:
-        print("   Sheet GAGAL (disimpan, dicoba lagi nanti):", e)
-        left = queue
-    if left:
-        with open(pending_path, "w", encoding="utf-8") as f:
-            f.writelines(json.dumps(r) + "\n" for r in left)
-    else:
-        if os.path.exists(pending_path):
-            os.remove(pending_path)
+class Sheet:
+    """Koneksi Google Sheet yang tahan sinyal putus: baris yang gagal dikirim disimpan di file
+    pending dan dikirim ulang otomatis begitu internet kembali."""
+
+    def __init__(self, sheet_id, tab, pending_path):
+        self.sheet_id, self.tab, self.pending_path = sheet_id, tab, pending_path
+        self.ws = None
+
+    def _load(self):
+        if not os.path.exists(self.pending_path):
+            return []
+        with open(self.pending_path, encoding="utf-8") as f:
+            return [json.loads(l) for l in f if l.strip()]
+
+    def _save(self, queue):
+        if queue:
+            with open(self.pending_path, "w", encoding="utf-8") as f:
+                f.writelines(json.dumps(r) + "\n" for r in queue)
+        elif os.path.exists(self.pending_path):
+            os.remove(self.pending_path)
+
+    def pending_count(self):
+        return len(self._load())
+
+    def send(self, row=None):
+        queue = self._load()
+        if row is not None:
+            queue.append(row)
+        if not queue:
+            return
+        try:
+            if self.ws is None:
+                self.ws = open_worksheet(self.sheet_id, self.tab)
+                print(f"   Google Sheet terhubung: tab '{self.tab}'")
+            self.ws.append_rows([[r.get(c, "") for c in COLUMNS] for r in queue],
+                                value_input_option="USER_ENTERED")
+        except Exception as e:
+            self.ws = None  # paksa sambung ulang di percobaan berikutnya
+            self._save(queue)
+            print(f"   Sheet GAGAL, {len(queue)} baris disimpan & dicoba lagi nanti: {e}")
+            return
+        self._save([])
         print(f"   Sheet OK ({len(queue)} baris terkirim)")
+
+
+# ------------------------------------------------------------ Chrome & lanjutkan
+def chrome_alive(cdp):
+    try:
+        with urllib.request.urlopen(cdp.rstrip("/") + "/json/version", timeout=3):
+            return True
+    except Exception:
+        return False
+
+
+def ensure_chrome(cdp):
+    """Kalau Chrome (port debugging) belum jalan - mis. habis laptop restart - buka otomatis
+    dengan profil yang sama, jadi login Seller Center tetap tersimpan."""
+    if chrome_alive(cdp):
+        return True
+    cands = [
+        r"C:\Program Files\Google\Chrome\Application\chrome.exe",
+        r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
+        os.path.expandvars(r"%LocalAppData%\Google\Chrome\Application\chrome.exe"),
+    ]
+    exe = next((c for c in cands if os.path.exists(c)), None)
+    if not exe:
+        print("   Chrome tidak ditemukan.")
+        return False
+    port = cdp.rstrip("/").rsplit(":", 1)[-1]
+    print(f"   Chrome belum jalan, membuka Chrome (port {port}) ...")
+    subprocess.Popen([exe, f"--remote-debugging-port={port}", f"--user-data-dir={CHROME_PROFILE}", URL])
+    for _ in range(30):
+        time.sleep(2)
+        if chrome_alive(cdp):
+            return True
+    return False
+
+
+def done_hours(path):
+    """Jam (Target Hour) yang sudah tercatat di CSV dengan data segar."""
+    out = set()
+    if not os.path.exists(path):
+        return out
+    with open(path, encoding="utf-8-sig", newline="") as f:
+        for r in csv.DictReader(f):
+            if r.get("Target Hour") and str(r.get("Fresh", "")).startswith("ya"):
+                out.add(r["Target Hour"])
+    return out
+
+
+def take_lock():
+    """Cegah 2 worker jalan bersamaan (mis. autostart + tombol di panel)."""
+    try:
+        with open(PID_FILE) as f:
+            old = int(f.read().strip())
+    except Exception:
+        old = None
+    if old and old != os.getpid():
+        if os.name == "nt":
+            out = subprocess.run(["tasklist", "/FI", f"PID eq {old}", "/NH"],
+                                 capture_output=True, text=True).stdout
+            alive = str(old) in out and "python" in out.lower()
+        else:
+            try:
+                os.kill(old, 0)
+                alive = True
+            except OSError:
+                alive = False
+        if alive:
+            return False
+    with open(PID_FILE, "w") as f:
+        f.write(str(os.getpid()))
+    return True
 
 
 def next_run(minute):
@@ -204,10 +302,48 @@ def next_run(minute):
     return t
 
 
+def hour_key(dt):
+    return f"{dt:%Y-%m-%d %H:00}"
+
+
+def capture_hour(pw, args, sheet, target_hour):
+    """Ambil data 1 jam. Kalau gagal (sinyal putus / Chrome tertutup) coba lagi tiap RETRY_SEC
+    sampai jam tersebut hampir habis. Return True kalau berhasil."""
+    deadline = target_hour + timedelta(minutes=58)
+    attempt = 0
+    while True:
+        attempt += 1
+        print(f"[{datetime.now():%H:%M:%S}] ambil data jam {target_hour:%H:00} (percobaan {attempt})")
+        try:
+            if not ensure_chrome(args.cdp):
+                raise RuntimeError("Chrome (port debugging) tidak bisa dihubungi")
+            browser = pw.chromium.connect_over_cdp(args.cdp)
+            try:
+                row = scrape_once(browser.contexts[0], target_hour, args.wait)
+            finally:
+                try:
+                    browser.close()  # hanya memutus koneksi CDP, Chrome tetap terbuka
+                except Exception:
+                    pass
+            write_row(args.out, row)
+            print("   OK:", {k: row[k] for k in ("Updated On", "GMV", "Items Sold", "Affiliate GMV", "Seller GMV")})
+            if sheet:
+                sheet.send(row)
+            return True
+        except Exception as e:
+            msg = str(e).strip().splitlines()
+            print("   GAGAL:", msg[0] if msg else repr(e))
+        if args.once or datetime.now() + timedelta(seconds=RETRY_SEC) >= deadline:
+            print(f"   Menyerah untuk jam {target_hour:%H:00}.")
+            return False
+        print(f"   coba lagi dalam {RETRY_SEC // 60} menit ...")
+        time.sleep(RETRY_SEC)
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--cdp", default="http://localhost:9222")
-    ap.add_argument("--out", default="shop_analytics_hourly.csv")
+    ap.add_argument("--out", default=os.path.join(HERE, "shop_analytics_hourly.csv"))
     ap.add_argument("--minute", type=int, default=1, help="menit pengambilan tiap jam (default 1 = HH:01)")
     ap.add_argument("--wait", type=int, default=10, help="maks menit menunggu data ter-update")
     ap.add_argument("--once", action="store_true", help="ambil sekali sekarang lalu selesai")
@@ -219,6 +355,10 @@ def main():
     args = ap.parse_args()
     pending_path = os.path.splitext(args.out)[0] + ".sheet_pending.jsonl"
 
+    if not args.once and not take_lock():
+        print("Worker lain sudah berjalan, keluar.")
+        return
+
     stop_at = None
     if args.stop_hour and not args.once:
         base = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
@@ -227,37 +367,42 @@ def main():
             stop_at += timedelta(days=1)
         print(f"Mode jaga berhenti pada {stop_at:%Y-%m-%d %H:%M}")
 
-    ws = None
-    if not args.no_sheet:
-        ws = open_worksheet(args.sheet_id, args.sheet_tab)
-        print(f"Google Sheet terhubung: tab '{args.sheet_tab}'")
+    sheet = None if args.no_sheet else Sheet(args.sheet_id, args.sheet_tab, pending_path)
+    if sheet and sheet.pending_count():
+        print(f"Ada {sheet.pending_count()} baris tertunda, kirim ulang ...")
+        sheet.send()
 
+    print(f"[{datetime.now():%Y-%m-%d %H:%M:%S}] worker mulai (PID {os.getpid()})")
     with sync_playwright() as pw:
-        browser = pw.chromium.connect_over_cdp(args.cdp)
-        ctx = browser.contexts[0]
+        if args.once:
+            capture_hour(pw, args, sheet, datetime.now().replace(minute=0, second=0, microsecond=0))
+            print("Selesai.")
+            return
 
         while True:
-            if not args.once:
-                t = next_run(args.minute)
-                if stop_at and t >= stop_at:
-                    print("Batas jam berhenti tercapai.")
-                    break
-                print(f"Menunggu {t:%H:%M} ...")
-                while datetime.now() < t:
-                    time.sleep(5)
-            target_hour = datetime.now().replace(minute=0, second=0, microsecond=0)
-            print(f"[{datetime.now():%H:%M:%S}] ambil data jam {target_hour:%H:00}")
-            try:
-                row = scrape_once(ctx, target_hour, args.wait)
-                write_row(args.out, row)
-                print("   OK:", {k: row[k] for k in ("Updated On", "GMV", "Items Sold", "Affiliate GMV", "Seller GMV")})
-                if ws is not None:
-                    send_to_sheet(ws, row, pending_path)
-            except Exception as e:
-                print("   GAGAL:", e)
-            if args.once:
+            # LANJUTKAN: jam sekarang belum tercatat (laptop baru nyala / bangun dari sleep / sinyal
+            # sempat putus) -> langsung ambil, tidak perlu menunggu jam berikutnya.
+            now = datetime.now()
+            cur = now.replace(minute=0, second=0, microsecond=0)
+            if now.minute >= args.minute and hour_key(cur) not in done_hours(args.out):
+                if not (stop_at and now >= stop_at):
+                    capture_hour(pw, args, sheet, cur)
+
+            t = next_run(args.minute)
+            if stop_at and t >= stop_at:
+                print("Batas jam berhenti tercapai.")
                 break
-    print("Selesai." if args.once else "")
+            print(f"Menunggu {t:%H:%M} ...")
+            last = datetime.now()
+            while datetime.now() < t:
+                time.sleep(5)
+                now = datetime.now()
+                if (now - last).total_seconds() > 300:  # jam "loncat" = laptop habis sleep/hibernate
+                    print(f"[{now:%H:%M:%S}] laptop bangun dari sleep, lanjutkan")
+                    break
+                last = now
+            if sheet and sheet.pending_count():
+                sheet.send()
 
 
 if __name__ == "__main__":
