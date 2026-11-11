@@ -190,8 +190,14 @@ else:
     out_name = st.sidebar.text_input("File hasil (CSV)", "shop_analytics_hourly.csv")
     out_path = (BASE / out_name).resolve()
 auto = st.sidebar.checkbox("Auto-refresh tiap 60 detik" if CLOUD else "Auto-refresh tiap 15 detik", value=False)
-if source == "Google Sheet" and st.sidebar.button("🔄 Muat ulang data Sheet"):
-    load_sheet.clear()
+if source == "Google Sheet":
+    if st.sidebar.button("🔄 Muat ulang data Sheet"):
+        load_sheet.clear()
+    st.sidebar.link_button("📄 Buka Google Sheet", f"https://docs.google.com/spreadsheets/d/{sheet_id}/edit")
+if CLOUD:
+    st.sidebar.info("Versi web hanya **menampilkan data**. Tombol Chrome, mulai/berhenti pengambilan "
+                    "dan log ada di panel **laptop** (`py -m streamlit run shop_analytics_app.py`), "
+                    "karena pengambilan data butuh Chrome di laptop yang login Seller Center.")
 
 st.title("📈 Shop Analytics — snapshot per jam")
 
@@ -269,8 +275,15 @@ if err is not None:
     if CLOUD:
         st.caption("Cek isi Settings → Secrets di Streamlit Cloud (bagian [gcp_oauth] dan [sheet]).")
 elif df is None:
-    st.caption("Belum ada data. Jalankan worker di laptop (Tes ambil sekarang / mode jaga) dulu.")
+    where = "Google Sheet masih kosong" if source == "Google Sheet" else "CSV lokal masih kosong"
+    st.warning(f"{where}. Jalankan worker di laptop (Tes ambil sekarang / mode jaga) dulu.")
 else:
+    newest = df.iloc[-1]
+    age = datetime.now() - newest["Target Hour"].to_pydatetime() if not CLOUD else None
+    st.sidebar.metric("Data terakhir", f"{newest['Target Hour']:%d %b %H:00}")
+    st.sidebar.caption(f"{len(df)} jam tercatat")
+    if age is not None and age > timedelta(hours=2):
+        st.warning(f"Data terakhir {newest['Target Hour']:%d %b %H:00} — worker mungkin berhenti.")
     dates = sorted(df["Tanggal"].unique(), reverse=True)
     pick = st.selectbox("Tanggal", dates, index=0)
     d = df[df["Tanggal"] == pick].copy()
