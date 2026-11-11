@@ -1,0 +1,12 @@
+# Rahasia - JANGAN di-upload
+oauth_client.json
+authorized_user.json
+*.json.bak
+
+# Data & runtime
+*.csv
+*.sheet_pending.jsonl
+worker.log
+worker.pid
+debug/
+__pycache__/
