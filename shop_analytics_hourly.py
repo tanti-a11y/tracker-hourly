@@ -133,6 +133,15 @@ def scrape_once(ctx, target_hour, max_wait_min):
             page.wait_for_timeout(60000)
 
         km = parse_key_metrics(text)
+        # angka Key metrics kadang belum selesai dimuat -> tunggu sampai GMV terbaca (maks ±30 dtk)
+        for _ in range(10):
+            if all(km.get(k) != "" for k in ("GMV", "Items Sold", "SKU Orders", "Orders")):
+                break
+            page.wait_for_timeout(3000)
+            text = page.locator("body").inner_text()
+            km = parse_key_metrics(text)
+        else:
+            raise RuntimeError("Key metrics (GMV/Items sold/...) tidak terbaca, halaman belum selesai dimuat")
 
         # scroll ke GMV breakdown -> klik By order source
         page.get_by_text("GMV breakdown", exact=True).first.scroll_into_view_if_needed()
@@ -176,6 +185,11 @@ def open_worksheet(sheet_id, tab):
     ws = gc.open_by_key(sheet_id).worksheet(tab)
     if ws.row_values(1) != COLUMNS:
         ws.update([COLUMNS], "A1")
+    try:  # tampilan: kolom waktu = teks apa adanya, kolom angka = 1.234.567 tanpa desimal
+        ws.format("A:D", {"numberFormat": {"type": "TEXT"}})
+        ws.format("E:P", {"numberFormat": {"type": "NUMBER", "pattern": "#,##0"}})
+    except Exception:
+        pass
     return ws
 
 
@@ -214,7 +228,7 @@ class Sheet:
                 self.ws = open_worksheet(self.sheet_id, self.tab)
                 print(f"   Google Sheet terhubung: tab '{self.tab}'")
             self.ws.append_rows([[r.get(c, "") for c in COLUMNS] for r in queue],
-                                value_input_option="USER_ENTERED")
+                                value_input_option="RAW")  # RAW: tanggal tetap teks persis
         except Exception as e:
             self.ws = None  # paksa sambung ulang di percobaan berikutnya
             self._save(queue)
