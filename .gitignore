@@ -10,3 +10,6 @@ worker.log
 worker.pid
 debug/
 __pycache__/
+
+# Secrets Streamlit
+.streamlit/secrets.toml
