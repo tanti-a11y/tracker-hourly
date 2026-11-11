@@ -127,7 +127,15 @@ def prepare(df):
     df = df.dropna(subset=["Target Hour"]).sort_values("Target Hour")
     if df.empty:
         return None
-    df = df.drop_duplicates(subset=["Target Hour"], keep="last")
+    # 1 baris per jam: pilih yang paling dekat ke jam bulat (Updated On - Target Hour terkecil).
+    # Baris isi-ulang dari tren per jam = tepat jam bulat (selisih 0).
+    upd = pd.to_datetime(df.get("Updated On", pd.Series(index=df.index, dtype=str)).astype(str),
+                         format="%b %d, %Y %I:%M %p", errors="coerce")
+    lag = (upd - df["Target Hour"]).dt.total_seconds().fillna(0).abs()
+    if "Fresh" in df.columns:  # data lama (TIDAK) paling belakang
+        lag = lag + df["Fresh"].astype(str).str.startswith("TIDAK") * 1e9
+    df = df.assign(_lag=lag).sort_values(["Target Hour", "_lag"])
+    df = df.drop_duplicates(subset=["Target Hour"], keep="first").drop(columns="_lag")
     df["Tanggal"] = df["Target Hour"].dt.date
     df["Jam"] = df["Target Hour"].dt.strftime("%H:00")
     df["GMV jam ini (selisih)"] = df.groupby("Tanggal")["GMV"].diff()

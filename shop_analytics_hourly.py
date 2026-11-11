@@ -174,6 +174,128 @@ def write_row(path, row):
         w.writerow(row)
 
 
+# ------------------------------------------------------------ isi ulang jam terlewat
+# Halaman Shop analytics memuat tren per jam (API us_overview_hour_trend) untuk HARI INI dan
+# KEMARIN. Angka snapshot jam H = jumlah semua interval sebelum jam H (00:00 s.d. H-1:59),
+# sama dengan yang tampil di "Key metrics" saat "Updated on" = H:00.
+TREND_API = "us_overview_hour_trend"
+TREND_MAP = {  # kolom kita -> ID metrik TikTok (dicocokkan dengan capture asli 11 Nov 2026)
+    "GMV": "4025", "Items Sold": "4028", "SKU Orders": "4036", "Orders": "4032",
+    "Affiliate GMV": "7818", "Affiliate - LIVE streams": "4076",
+    "Affiliate - Videos": "4078", "Affiliate - Product cards": "7811",
+    "Seller GMV": "7817", "Seller - LIVE streams": "4077",
+    "Seller - Videos": "4079", "Seller - Product cards": "7812",
+}
+
+
+def _metric(v):
+    if isinstance(v, str) and v.startswith("{"):
+        v = json.loads(v).get("amount", "0")
+    try:
+        return float(v or 0)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def fetch_hour_trend(ctx):
+    """Buka Shop analytics & tangkap data tren per jam. Return {tanggal: {jam: {metrik: nilai}}}."""
+    page = ctx.new_page()
+    try:
+        with page.expect_response(lambda r: TREND_API in r.url, timeout=90000) as info:
+            page.goto(URL, wait_until="domcontentloaded")
+        data = info.value.json()
+    finally:
+        page.close()
+    out = {}
+    for block in data.get("data", []):
+        for key in ("intervals", "compare_to_intervals"):
+            for iv in block.get(key, []):
+                start = datetime.strptime(iv["start_date"], "%Y-%m-%d %H:%M:%S")
+                vals = (iv.get("rows") or [{}])[0].get("values", {})
+                out.setdefault(start.date(), {})[start.hour] = {
+                    col: _metric(vals.get(mid)) for col, mid in TREND_MAP.items()}
+    return out
+
+
+def backfill_rows(trend, skip, before, earliest=None):
+    """Bangun baris snapshot untuk jam-jam yang belum ada di `skip`, hanya jam < `before`
+    (jam yang sudah lengkap) dan >= `earliest` kalau diberikan."""
+    rows = []
+    now = f"{datetime.now():%Y-%m-%d %H:%M:%S}"
+    for day in sorted(trend):
+        hours = trend[day]
+        for h in range(1, 24):  # snapshot H:00 = interval 00..H-1
+            target = datetime.combine(day, datetime.min.time()) + timedelta(hours=h)
+            if target >= before or (earliest and target < earliest) or hour_key(target) in skip:
+                continue
+            if not all(x in hours for x in range(h)):
+                continue  # data jam sebelumnya tidak lengkap
+            row = {c: "" for c in COLUMNS}
+            for col in TREND_MAP:
+                row[col] = int(round(sum(hours[x][col] for x in range(h))))
+            row["Captured At"] = now
+            row["Target Hour"] = hour_key(target)
+            row["Updated On"] = "isi ulang dari tren per jam"
+            row["Fresh"] = "ya (isi ulang)"
+            rows.append(row)
+    return rows
+
+
+def first_hour(path):
+    if not os.path.exists(path):
+        return None
+    with open(path, encoding="utf-8-sig", newline="") as f:
+        hs = [r["Target Hour"] for r in csv.DictReader(f) if r.get("Target Hour")]
+    return datetime.strptime(min(hs), "%Y-%m-%d %H:%M") if hs else None
+
+
+def has_gap(path):
+    """Ada jam lengkap (setelah data pertama, maks sejak kemarin) yang belum tercatat?"""
+    first = first_hour(path)
+    if not first:
+        return False
+    cur = datetime.now().replace(minute=0, second=0, microsecond=0)
+    t = max(first, cur.replace(hour=0) - timedelta(days=1))
+    done = done_hours(path)
+    while t < cur:
+        if t.hour != 0 and hour_key(t) not in done:
+            return True
+        t += timedelta(hours=1)
+    return False
+
+
+def run_backfill(pw, args, sheet, all_hours=False):
+    """Isi jam yang terlewat (hari ini & kemarin). Default hanya celah setelah data pertama di CSV;
+    all_hours=True mengisi semua jam yang tersedia."""
+    try:
+        if not ensure_chrome(args.cdp):
+            raise RuntimeError("Chrome (port debugging) tidak bisa dihubungi")
+        browser = pw.chromium.connect_over_cdp(args.cdp)
+        try:
+            trend = fetch_hour_trend(browser.contexts[0])
+        finally:
+            try:
+                browser.close()
+            except Exception:
+                pass
+    except Exception as e:
+        msg = str(e).strip().splitlines()
+        print("   Isi ulang GAGAL:", msg[0] if msg else repr(e))
+        return 0
+    cur = datetime.now().replace(minute=0, second=0, microsecond=0)
+    rows = backfill_rows(trend, done_hours(args.out), before=cur,
+                         earliest=None if all_hours else first_hour(args.out))
+    if not rows:
+        print("   Tidak ada jam terlewat.")
+        return 0
+    for r in rows:
+        write_row(args.out, r)
+    print(f"   Isi ulang {len(rows)} jam: {rows[0]['Target Hour']} s.d. {rows[-1]['Target Hour']}")
+    if sheet:
+        sheet.send(rows=rows)
+    return len(rows)
+
+
 # ------------------------------------------------------------ Google Sheets
 def open_worksheet(sheet_id, tab):
     """Login Google OAuth (pertama kali buka browser), token disimpan di authorized_user.json."""
@@ -217,10 +339,11 @@ class Sheet:
     def pending_count(self):
         return len(self._load())
 
-    def send(self, row=None):
+    def send(self, row=None, rows=None):
         queue = self._load()
         if row is not None:
             queue.append(row)
+        queue.extend(rows or [])
         if not queue:
             return
         try:
@@ -229,6 +352,10 @@ class Sheet:
                 print(f"   Google Sheet terhubung: tab '{self.tab}'")
             self.ws.append_rows([[r.get(c, "") for c in COLUMNS] for r in queue],
                                 value_input_option="RAW")  # RAW: tanggal tetap teks persis
+            try:  # urutkan menurut Target Hour supaya baris isi-ulang masuk ke posisinya
+                self.ws.sort((2, "asc"), (1, "asc"), range=f"A2:P{self.ws.row_count}")
+            except Exception:
+                pass
         except Exception as e:
             self.ws = None  # paksa sambung ulang di percobaan berikutnya
             self._save(queue)
@@ -366,8 +493,12 @@ def main():
     ap.add_argument("--no-sheet", action="store_true", help="jangan kirim ke Google Sheet (CSV saja)")
     ap.add_argument("--stop-hour", type=int, default=0,
                     help="berhenti pada jam ini (24 = tengah malam, 0 = tanpa batas)")
+    ap.add_argument("--backfill", action="store_true",
+                    help="isi semua jam yang terlewat hari ini & kemarin (dari tren per jam), lalu selesai")
     args = ap.parse_args()
     pending_path = os.path.splitext(args.out)[0] + ".sheet_pending.jsonl"
+    if args.backfill:
+        args.once = True  # perintah sekali jalan, tidak pakai kunci worker
 
     if not args.once and not take_lock():
         print("Worker lain sudah berjalan, keluar.")
@@ -388,6 +519,11 @@ def main():
 
     print(f"[{datetime.now():%Y-%m-%d %H:%M:%S}] worker mulai (PID {os.getpid()})")
     with sync_playwright() as pw:
+        if args.backfill:
+            print("Isi ulang semua jam yang terlewat (hari ini & kemarin) ...")
+            run_backfill(pw, args, sheet, all_hours=True)
+            print("Selesai.")
+            return
         if args.once:
             capture_hour(pw, args, sheet, datetime.now().replace(minute=0, second=0, microsecond=0))
             print("Selesai.")
@@ -401,6 +537,11 @@ def main():
             if now.minute >= args.minute and hour_key(cur) not in done_hours(args.out):
                 if not (stop_at and now >= stop_at):
                     capture_hour(pw, args, sheet, cur)
+
+            # ISI ULANG: ada jam bolong (laptop mati / gagal sejam penuh)? ambil dari tren per jam
+            if has_gap(args.out):
+                print(f"[{datetime.now():%H:%M:%S}] ada jam terlewat, isi ulang dari tren per jam ...")
+                run_backfill(pw, args, sheet)
 
             t = next_run(args.minute)
             if stop_at and t >= stop_at:
